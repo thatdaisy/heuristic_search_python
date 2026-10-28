@@ -1,288 +1,173 @@
-import random
+"""8-puzzle solver (A*) with Manhattan or Hamming heuristic.
+
+Usage: python eight_puzzle.py --heuristic manhattan --runs 10 --showPath
+"""
+import argparse
 import heapq
+import itertools
+import random
 import time
-import statistics
-import csv
+from dataclasses import dataclass, field
 
-GOAL_STATE = (1, 2, 3, 4, 5, 6, 7, 8, 0)
-GOAL_POSITIONS = {value: divmod(index, 3) for index, value in enumerate(GOAL_STATE)}
-
-
-def print_state(state):
-    """Print a puzzle state in 3x3 format."""
-    for i in range(0, 9, 3):
-        print(state[i:i+3])
-    print()
-
-
-def count_inversions(state):
-    """
-    Count inversions in the puzzle state.
-    The blank tile (0) is ignored.
-    Input: tuple of length 9
-    Output: integer inversion count
-    """
-    tiles = [x for x in state if x != 0]
-    inversions = 0
-    for i in range(len(tiles)):
-        for j in range(i + 1, len(tiles)):
-            if tiles[i] > tiles[j]:
-                inversions += 1
-    return inversions
+# ---------------------------------------------------------------------------
+# 1) ARRAY REPRESENTATION OF THE GOAL STATE
+# The 3x3 board is stored as a flat array of 9 cells (index 0..8, row by row):
+#     index:  0 1 2      value:  1 2 3
+#             3 4 5              4 5 6
+#             6 7 8              7 8 _   (0 = blank)
+# A tuple is used because it is immutable and can be a dictionary key.
+# ---------------------------------------------------------------------------
+GOAL = (1, 2, 3, 4, 5, 6, 7, 8, 0)
+GOAL_POS = {tile: i for i, tile in enumerate(GOAL)}   # tile -> goal index
 
 
-def is_solvable(state):
-    """
-    Check if an 8-puzzle state is solvable.
-    For a 3x3 puzzle, solvable iff inversion count is even.
-    Input: tuple of length 9
-    Output: True/False
-    """
-    return count_inversions(state) % 2 == 0
+# ---------------------------------------------------------------------------
+# 2) DATA STRUCTURE FOR A STATE (NODE)
+# ---------------------------------------------------------------------------
+@dataclass
+class Node:
+    state: tuple                                # board: array of 9 cells
+    g: int = 0                                  # cost so far: +1 per move
+    h: int = 0                                  # estimated cost to goal
+    path: list = field(default_factory=list)    # states visited so far
+
+    @property
+    def f(self):                                # total estimated cost
+        return self.g + self.h
 
 
-def generate_random_state():
-    """
-    Generate a random solvable 8-puzzle state.
-    Input: none
-    Output: solvable tuple state
-    """
-    while True:
-        state = list(range(9))
-        random.shuffle(state)
-        state = tuple(state)
-        if is_solvable(state):
-            return state
-
-
-def get_neighbors(state):
-    """
-    Generate all valid neighbor states by moving the blank tile.
-    Input: tuple state
-    Output: list of neighboring tuple states
-    """
-    neighbors = []
-    zero_index = state.index(0)
-    row, col = divmod(zero_index, 3)
-
-    moves = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-    for dr, dc in moves:
-        new_row = row + dr
-        new_col = col + dc
-
-        if 0 <= new_row < 3 and 0 <= new_col < 3:
-            new_zero_index = new_row * 3 + new_col
-            new_state = list(state)
-            new_state[zero_index], new_state[new_zero_index] = new_state[new_zero_index], new_state[zero_index]
-            neighbors.append(tuple(new_state))
-
-    return neighbors
-
-
-def heuristic_hamming(state):
-    """
-    Hamming distance:
-    Number of misplaced tiles, excluding the blank.
-    Input: tuple state
-    Output: integer heuristic value
-    """
-    misplaced = 0
+# ---------------------------------------------------------------------------
+# 3) VALID TRANSITIONS
+# For every possible blank position the table lists the cells it may swap
+# with (up, down, left, right - but never over the edge of the board).
+# It is built once; make_a_move() can only ever use moves from this table.
+# ---------------------------------------------------------------------------
+def build_valid_moves():
+    table = {}
     for i in range(9):
-        if state[i] != 0 and state[i] != GOAL_STATE[i]:
-            misplaced += 1
-    return misplaced
+        row, col = divmod(i, 3)
+        table[i] = []
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            r, c = row + dr, col + dc
+            if 0 <= r < 3 and 0 <= c < 3:       # stay inside the board
+                table[i].append(r * 3 + c)
+    return table
 
 
-def heuristic_manhattan(state):
-    """
-    Manhattan distance:
-    Sum of row/column distances of each tile from its goal position.
-    Input: tuple state
-    Output: integer heuristic value
-    """
-    distance = 0
-    for index, tile in enumerate(state):
-        if tile != 0:
-            current_row, current_col = divmod(index, 3)
-            goal_row, goal_col = GOAL_POSITIONS[tile]
-            distance += abs(current_row - goal_row) + abs(current_col - goal_col)
-    return distance
+VALID_MOVES = build_valid_moves()   # e.g. {0: [3, 1], 4: [1, 7, 3, 5], ...}
+
+stats = []  # one dict per run
+
+def calculate_heuristic(node, heuristic):
+    """Estimated cost to reach GOAL: 'manhattan' or 'hamming'."""
+    tiles = [(i, t) for i, t in enumerate(node.state) if t != 0]
+    if heuristic == "hamming":
+        return sum(1 for i, t in tiles if t != GOAL[i])
+    total = 0
+    for i, t in tiles:
+        goal_row, goal_col = divmod(GOAL_POS[t], 3)
+        row, col = divmod(i, 3)
+        total += abs(row - goal_row) + abs(col - goal_col)
+    return total
+
+def make_a_move(node, heuristic):
+    """Slide the blank only along valid transitions; return the new nodes.
+    Each new node has g + 1 and the taken path saved."""
+    blank = node.state.index(0)
+    children = []
+    for target in VALID_MOVES[blank]:           # only legal swaps
+        s = list(node.state)
+        s[blank], s[target] = s[target], s[blank]
+        child = Node(tuple(s), node.g + 1, 0, node.path + [tuple(s)])
+        child.h = calculate_heuristic(child, heuristic)
+        children.append(child)
+    return children
 
 
-def reconstruct_path(came_from, current):
-    """
-    Reconstruct solution path from start to goal.
-    Input: parent dictionary, goal state
-    Output: list of states from start to goal
-    """
-    path = [current]
-    while current in came_from:
-        current = came_from[current]
-        path.append(current)
-    path.reverse()
-    return path
+def is_solvable(node):
+    """Solvable if the number of inversions is even (3x3 board)."""
+    tiles = [t for t in node.state if t != 0]
+    inversions = sum(a > b for a, b in itertools.combinations(tiles, 2))
+    return inversions % 2 == 0
 
 
-def a_star_search(start_state, heuristic_func):
-    """
-    Solve the 8-puzzle using A* search.
-
-    Inputs:
-    - start_state: tuple
-    - heuristic_func: function
-
-    Outputs:
-    - solution_path: list of states from start to goal
-    - nodes_expanded: integer
-    - solution_depth: integer
-    """
-    open_heap = []
-    heap_counter = 0
-
-    g_score = {start_state: 0}
-    came_from = {}
-    closed_set = set()
-    nodes_expanded = 0
-
-    start_h = heuristic_func(start_state)
-    heapq.heappush(open_heap, (start_h, heap_counter, start_state))
-
-    while open_heap:
-        _, _, current = heapq.heappop(open_heap)
-
-        if current in closed_set:
-            continue
-
-        if current == GOAL_STATE:
-            path = reconstruct_path(came_from, current)
-            return path, nodes_expanded, len(path) - 1
-
-        closed_set.add(current)
-        nodes_expanded += 1
-
-        current_g = g_score[current]
-
-        for neighbor in get_neighbors(current):
-            if neighbor in closed_set:
-                continue
-
-            tentative_g = current_g + 1
-
-            if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                f_score = tentative_g + heuristic_func(neighbor)
-                heap_counter += 1
-                heapq.heappush(open_heap, (f_score, heap_counter, neighbor))
-
-    return None, nodes_expanded, None
+def is_solved(node):
+    return node.state == GOAL
 
 
-def benchmark_heuristic(test_states, heuristic_func, heuristic_name):
-    """
-    Run benchmark for a heuristic over multiple test states.
-
-    Inputs:
-    - test_states: list of tuple states
-    - heuristic_func: heuristic function
-    - heuristic_name: string
-
-    Outputs:
-    - dictionary with raw results and statistics
-    """
-    nodes_list = []
-    times_list = []
-    solution_lengths = []
-
-    print(f'Running benchmark for {heuristic_name}...')
-
-    for i, state in enumerate(test_states, start=1):
-        start_time = time.perf_counter()
-        path, nodes_expanded, solution_depth = a_star_search(state, heuristic_func)
-        end_time = time.perf_counter()
-
-        runtime = end_time - start_time
-
-        nodes_list.append(nodes_expanded)
-        times_list.append(runtime)
-        solution_lengths.append(solution_depth)
-
-        print(f'Test {i:3d}: nodes={nodes_expanded:6d}, time={runtime:.6f}s, depth={solution_depth}')
-
-    return {
-        'heuristic': heuristic_name,
-        'nodes': nodes_list,
-        'times': times_list,
-        'depths': solution_lengths,
-        'mean_nodes': statistics.mean(nodes_list),
-        'std_nodes': statistics.stdev(nodes_list) if len(nodes_list) > 1 else 0,
-        'mean_time': statistics.mean(times_list),
-        'std_time': statistics.stdev(times_list) if len(times_list) > 1 else 0,
-        'mean_depth': statistics.mean(solution_lengths),
-        'std_depth': statistics.stdev(solution_lengths) if len(solution_lengths) > 1 else 0,
-    }
+def random_start_node(heuristic):
+    """Random solvable start node."""
+    while True:
+        s = list(GOAL)
+        random.shuffle(s)
+        node = Node(tuple(s), 0, 0, [tuple(s)])
+        if is_solvable(node):
+            node.h = calculate_heuristic(node, heuristic)
+            return node
 
 
-def print_summary(result):
-    """Print summary statistics for one heuristic."""
-    print(f'=== {result["heuristic"]} SUMMARY ===')
-    print(f'Mean expanded nodes : {result["mean_nodes"]:.2f}')
-    print(f'Std dev nodes       : {result["std_nodes"]:.2f}')
-    print(f'Mean runtime (s)    : {result["mean_time"]:.6f}')
-    print(f'Std dev runtime (s) : {result["std_time"]:.6f}')
-    print(f'Mean solution depth : {result["mean_depth"]:.2f}')
-    print(f'Std dev depth       : {result["std_depth"]:.2f}')
+# ---------------------------------------------------------------------------
+# 4) HEAPQ AS PRIORITY QUEUE
+# heapq keeps the list ordered so that heappop() always returns the entry
+# with the smallest first value. Entries are (f, counter, node):
+#   f       -> lowest estimated total cost is expanded first
+#   counter -> unique tie-breaker, so two nodes are never compared directly
+# ---------------------------------------------------------------------------
+def orchestrate_search(node, heuristic=):
+    """A*: repeatedly expand the lowest f = g + h node until solved."""
+    start = time.perf_counter()
+    counter = itertools.count()
+    frontier = []                                            # the priority queue
+    heapq.heappush(frontier, (node.f, next(counter), node))
+    best_g = {node.state: 0}                                 # cheapest g per board
+    expanded = 0
+    while frontier:
+        _, _, current = heapq.heappop(frontier)              # best node first
+        if is_solved(current):
+            stats.append({"moves": current.g, "expanded": expanded,
+                          "time": time.perf_counter() - start})
+            return current
+        expanded += 1
+        for child in make_a_move(current, heuristic):
+            if child.g < best_g.get(child.state, float("inf")):
+                best_g[child.state] = child.g
+                heapq.heappush(frontier, (child.f, next(counter), child))
+    return None
 
 
-def compare_results(hamming_result, manhattan_result):
-    """Print a comparison table between heuristics."""
-    print('=== COMPARISON TABLE ===')
-    print(f'{"Metric":25s} {"Hamming":>15s} {"Manhattan":>15s}')
-    print('-' * 60)
-    print(f'{"Mean expanded nodes":25s} {hamming_result["mean_nodes"]:15.2f} {manhattan_result["mean_nodes"]:15.2f}')
-    print(f'{"Std dev nodes":25s} {hamming_result["std_nodes"]:15.2f} {manhattan_result["std_nodes"]:15.2f}')
-    print(f'{"Mean runtime (s)":25s} {hamming_result["mean_time"]:15.6f} {manhattan_result["mean_time"]:15.6f}')
-    print(f'{"Std dev runtime (s)":25s} {hamming_result["std_time"]:15.6f} {manhattan_result["std_time"]:15.6f}')
-    print(f'{"Mean solution depth":25s} {hamming_result["mean_depth"]:15.2f} {manhattan_result["mean_depth"]:15.2f}')
-
-
-def save_results_csv(hamming_result, manhattan_result, filename='benchmark_results.csv'):
-    """Save summary results to CSV."""
-    with open(filename, 'w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(['Metric', 'Hamming', 'Manhattan'])
-        writer.writerow(['Mean expanded nodes', hamming_result['mean_nodes'], manhattan_result['mean_nodes']])
-        writer.writerow(['Std dev nodes', hamming_result['std_nodes'], manhattan_result['std_nodes']])
-        writer.writerow(['Mean runtime (s)', hamming_result['mean_time'], manhattan_result['mean_time']])
-        writer.writerow(['Std dev runtime (s)', hamming_result['std_time'], manhattan_result['std_time']])
-        writer.writerow(['Mean solution depth', hamming_result['mean_depth'], manhattan_result['mean_depth']])
+def calc_statistics():
+    """Return a printable summary of all runs."""
+    if not stats:
+        return "No runs."
+    n = len(stats)
+    lines = [f"Runs: {n}"]
+    for key, label in (("moves", "Solution length"), ("expanded", "Nodes expanded"),
+                       ("time", "Time (s)")):
+        vals = [s[key] for s in stats]
+        lines.append(f"{label:16}: avg {sum(vals) / n:.3f} | min {min(vals):.3f} | max {max(vals):.3f}")
+    return "\n".join(lines)
 
 
 def main():
-    """
-    Main program:
-    1. Generate 100 solvable random states
-    2. Run A* with Hamming heuristic
-    3. Run A* with Manhattan heuristic
-    4. Print statistical comparison
-    5. Save summary CSV
-    """
-    num_tests = 100
+    parser = argparse.ArgumentParser(description="8-puzzle A* solver")
+    parser.add_argument("--heuristic", choices=["manhattan", "hamming"], default="manhattan")
+    parser.add_argument("--runs", type=int, default=10, help="number of test runs")
+    parser.add_argument("--showPath", action="store_true", help="show last solution path")
+    args = parser.parse_args()
 
-    print(f'Generating {num_tests} solvable random start states...')
-    test_states = [generate_random_state() for _ in range(num_tests)]
+    print("\n### Introduction to AI and Data Science - Task 1: Heuristic Search ###")
+    print(f">>> Heuristic: {args.heuristic} - Executions: {args.runs}\n")
 
-    hamming_result = benchmark_heuristic(test_states, heuristic_hamming, 'Hamming Distance')
-    manhattan_result = benchmark_heuristic(test_states, heuristic_manhattan, 'Manhattan Distance')
-
-    print_summary(hamming_result)
-    print_summary(manhattan_result)
-    compare_results(hamming_result, manhattan_result)
-    save_results_csv(hamming_result, manhattan_result)
-
-    print('Results saved to benchmark_results.csv')
-    print('Done.')
+    for i in range(1, args.runs + 1):
+        start = random_start_node(args.heuristic)
+        solved = orchestrate_search(start, args.heuristic)
+        s = stats[-1]
+        print(f"Run {i}: start={start.state} moves={s['moves']} expanded={s['expanded']}")
+    print("\n" + calc_statistics())
+    if args.showPath:
+        print("\nLast solution path:")
+        for step in solved.path:
+            print(step[:3], step[3:6], step[6:], sep="\n", end="\n\n")
 
 
 if __name__ == '__main__':
